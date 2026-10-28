@@ -2,7 +2,7 @@
 
 > **Centralized Internal Document Signing & Clearance Hub**
 
-A desktop-based document signing and clearance management system developed for the **University of the Immaculate Conception (UIC) – College of Computer Studies (CCS)**. SignIT aims to streamline internal document processing by replacing paper-based clearance procedures with a centralized digital workflow.
+A desktop-based document signing and clearance management system developed for the **University of the Immaculate Conception (UIC)**. SignIT aims to streamline internal document processing by replacing paper-based clearance procedures with a centralized digital workflow.
 
 ## 📌 Project Overview
 
