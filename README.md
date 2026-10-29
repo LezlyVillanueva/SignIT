@@ -142,6 +142,7 @@ The system maintains an append-only transaction log intended to improve accounta
 * View and manage pending document requests assigned to them.
 * Apply stored electronic signatures.
 * Approve documents or reject them for revision.
+* Can create documents.
 * Provide contextual comments and feedback.
 
 ### 🛡️ Super Admin
@@ -237,7 +238,6 @@ mvn exec:java
 ## 🚀 Future Enhancements
 
 * **Remote Cloud Database Synchronization:** Integration with AWS RDS or a remote MySQL server.
-* **PDF Clearance Certificate Export:** Generation of downloadable PDF certificates with embedded signature and verification metadata.
 * **Mobile Companion Application:** Support for mobile access, push notifications, and remote approvals.
 * **Email and SMS Notifications:** Automated alerts for document submissions, approvals, rejections, and revisions.
 * **Enhanced Audit Integrity:** Stronger cryptographic protections against unauthorized modification of transaction records.
