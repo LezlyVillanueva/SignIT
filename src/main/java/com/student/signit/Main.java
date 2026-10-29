@@ -9,7 +9,6 @@ import java.util.Map;
 import java.util.function.Function;
 import java.util.function.IntSupplier;
 
-/** SignIT - Campus clearance & e-signature platform (Java Swing). */
 public class Main {
     static JFrame frame;
     static JPanel root;

@@ -10,7 +10,8 @@ import java.util.*;
 
 /**
  * Central data store + workflow (state machine) engine + immutable audit ledger.
- * Data is persisted with Java serialization to ~/.signit/data.ser.
+ * Data lives in MySQL (see DbStore / schema.sql). If MySQL cannot be reached at start-up,
+ * the app falls back to Java serialization in ~/.signit/data.ser for that session.
  */
 final class Store implements Serializable {
     private static final long serialVersionUID = 1L;
@@ -29,6 +30,9 @@ final class Store implements Serializable {
     final List<AuditEntry> ledger = new ArrayList<>();
     int docSeq, userSeq;
     transient User current;
+    transient int ledgerSaved;                    // ledger rows already written to MySQL
+    static boolean dbMode;                        // true while MySQL is the storage
+    private static boolean dbWarned;
 
     // ---------------------------------------------------------------- lifecycle
     static Store get() {
@@ -37,24 +41,77 @@ final class Store implements Serializable {
     }
 
     private static Store load() {
+        try {
+            DbStore.ensureSchema();
+            dbMode = true;
+            if (DbStore.hasUsers()) return DbStore.load();
+            Store s = readFile();                       // empty database: import an old data.ser, otherwise seed demo data
+            if (s != null) {
+                for (User u : s.users) s.fixLibrary(u);
+                DbStore.sync(s);
+                try { Files.move(FILE, DIR.resolve("data.ser.imported"), StandardCopyOption.REPLACE_EXISTING); }
+                catch (IOException ignored) { }
+                return s;
+            }
+            s = new Store();
+            s.seed();
+            return s;
+        } catch (Exception e) {
+            dbMode = false;
+            e.printStackTrace();
+            notifyUser("Could not use MySQL (" + e.getMessage() + ").\nSignIT will keep its data in a local file for this session.\n\n"
+                    + "Check that MySQL is running and that the settings in Database.java are correct.");
+        }
+        Store s = readFile();
+        if (s != null) return s;
+        s = new Store();
+        s.seed();
+        return s;
+    }
+
+    private static Store readFile() {
         if (Files.exists(FILE)) {
             try (ObjectInputStream in = new ObjectInputStream(Files.newInputStream(FILE))) {
                 return (Store) in.readObject();
-            } catch (Exception ignored) { /* fall through and reseed */ }
+            } catch (Exception ignored) { /* fall through */ }
         }
-        Store s = new Store();
-        s.seed();
-        s.save();
-        return s;
+        return null;
+    }
+
+    private static void notifyUser(String msg) {
+        System.err.println(msg);
+        if (!java.awt.GraphicsEnvironment.isHeadless())
+            javax.swing.SwingUtilities.invokeLater(() -> javax.swing.JOptionPane.showMessageDialog(null, msg,
+                    "SignIT database", javax.swing.JOptionPane.WARNING_MESSAGE));
     }
 
     static void resetDemoData() {
         try { Files.deleteIfExists(FILE); } catch (IOException ignored) { }
+        try { Files.deleteIfExists(DIR.resolve("data.ser.imported")); } catch (IOException ignored) { }
+        if (dbMode) {
+            try { DbStore.wipe(); } catch (Exception e) { e.printStackTrace(); notifyUser("Could not clear MySQL: " + e.getMessage()); }
+        }
         inst = null;
         get();
     }
 
+    /** Writes everything to MySQL (or to the local file when MySQL is not in use). */
     void save() {
+        if (dbMode) {
+            try {
+                DbStore.sync(this);
+                dbWarned = false;
+            } catch (Exception e) {
+                e.printStackTrace();
+                if (!dbWarned) {
+                    dbWarned = true;
+                    notifyUser("Could not save to MySQL: " + e.getMessage()
+                            + "\n\nYour changes are kept in memory and will be saved on the next action once MySQL is back.\n"
+                            + "Do not close SignIT until it saves.");
+                }
+            }
+            return;
+        }
         try {
             Files.createDirectories(DIR);
             try (ObjectOutputStream o = new ObjectOutputStream(Files.newOutputStream(FILE))) {
@@ -169,6 +226,12 @@ final class Store implements Serializable {
     // ---------------------------------------------------------------- signature library
     /** The user's saved signature PNGs. The first entry is the default. Creates a typed one if the library is empty. */
     List<SigAsset> sigs(User u) {
+        if (fixLibrary(u)) save();
+        return u.library;
+    }
+
+    /** Makes sure the library exists, migrates an old single image, and guarantees one entry. True if anything changed. */
+    private boolean fixLibrary(User u) {
         boolean dirty = false;
         if (u.library == null) { u.library = new ArrayList<>(); dirty = true; }
         if (u.signatureImage != null) {                         // migrate the old single-image signature
@@ -180,8 +243,7 @@ final class Store implements Serializable {
             u.library.add(new SigAsset("Typed signature", SigTools.typedPng(u.signatureText == null ? u.name : u.signatureText)));
             dirty = true;
         }
-        if (dirty) save();
-        return u.library;
+        return dirty;
     }
 
     void addSignature(User u, String name, byte[] png) {
