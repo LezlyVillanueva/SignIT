@@ -42,13 +42,13 @@ final class Store implements Serializable {
 
     private static Store load() {
         try {
-            DbStore.ensureSchema();
+            Dbstore.ensureSchema();
             dbMode = true;
-            if (DbStore.hasUsers()) return DbStore.load();
+            if (Dbstore.hasUsers()) return Dbstore.load();
             Store s = readFile();                       // empty database: import an old data.ser, otherwise seed demo data
             if (s != null) {
                 for (User u : s.users) s.fixLibrary(u);
-                DbStore.sync(s);
+                Dbstore.sync(s);
                 try { Files.move(FILE, DIR.resolve("data.ser.imported"), StandardCopyOption.REPLACE_EXISTING); }
                 catch (IOException ignored) { }
                 return s;
@@ -89,7 +89,7 @@ final class Store implements Serializable {
         try { Files.deleteIfExists(FILE); } catch (IOException ignored) { }
         try { Files.deleteIfExists(DIR.resolve("data.ser.imported")); } catch (IOException ignored) { }
         if (dbMode) {
-            try { DbStore.wipe(); } catch (Exception e) { e.printStackTrace(); notifyUser("Could not clear MySQL: " + e.getMessage()); }
+            try { Dbstore.wipe(); } catch (Exception e) { e.printStackTrace(); notifyUser("Could not clear MySQL: " + e.getMessage()); }
         }
         inst = null;
         get();
@@ -99,7 +99,7 @@ final class Store implements Serializable {
     void save() {
         if (dbMode) {
             try {
-                DbStore.sync(this);
+                Dbstore.sync(this);
                 dbWarned = false;
             } catch (Exception e) {
                 e.printStackTrace();

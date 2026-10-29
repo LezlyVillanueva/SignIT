@@ -1,362 +1,411 @@
 package com.student.signit;
 
-import javax.swing.*;
-import javax.swing.border.EmptyBorder;
-import java.awt.*;
-import java.io.File;
-import java.util.ArrayList;
-import java.util.List;
+import java.sql.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.*;
 
-/** Screens and helpers shared between roles. */
-final class Common {
-    private Common() { }
+/**
+ * MySQL persistence for {@link Store}. The Store keeps working in memory exactly as before;
+ * this class loads it from the database at start-up and writes every change back (see schema.sql).
+ */
+final class Dbstore {
+    private Dbstore() { }
 
-    static String date(java.time.LocalDateTime t) { return t.format(Store.DATE); }
+    /** Same statements as schema.sql (kept in sync by hand when the schema changes). */
+    private static final String[] SCHEMA = {
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            k VARCHAR(40)  NOT NULL PRIMARY KEY,
+            v VARCHAR(255) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id             VARCHAR(16)  NOT NULL PRIMARY KEY,
+            name           VARCHAR(120) NOT NULL,
+            email          VARCHAR(160) NOT NULL UNIQUE,
+            pass_hash      CHAR(64)     NOT NULL,
+            department     VARCHAR(120) NOT NULL,
+            `position`     VARCHAR(120) NOT NULL,
+            role           ENUM('STUDENT','FACULTY','ADMIN') NOT NULL,
+            requested_role ENUM('STUDENT','FACULTY','ADMIN') NULL,
+            status         ENUM('PENDING_APPROVAL','ACTIVE','REJECTED') NOT NULL,
+            joined         DATE         NOT NULL,
+            signature_text VARCHAR(160) NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS signature_images (
+            hash CHAR(64)    NOT NULL PRIMARY KEY,
+            data MEDIUMBLOB  NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS user_signatures (
+            user_id    VARCHAR(16)  NOT NULL,
+            slot       INT          NOT NULL,
+            name       VARCHAR(160) NOT NULL,
+            image_hash CHAR(64)     NOT NULL,
+            PRIMARY KEY (user_id, slot),
+            CONSTRAINT fk_usersig_user  FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,
+            CONSTRAINT fk_usersig_image FOREIGN KEY (image_hash) REFERENCES signature_images(hash)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS documents (
+            id             VARCHAR(24)   NOT NULL PRIMARY KEY,
+            title          VARCHAR(255)  NOT NULL,
+            type           VARCHAR(40)   NOT NULL,
+            description    TEXT          NULL,
+            owner_id       VARCHAR(16)   NOT NULL,
+            current_step   INT           NOT NULL DEFAULT 0,
+            revision_step  INT           NOT NULL DEFAULT 0,
+            status         ENUM('PENDING_REVIEW','APPROVED','REVISION_REQUESTED','REJECTED') NOT NULL,
+            submitted      DATETIME      NOT NULL,
+            amount         DECIMAL(14,2) NOT NULL DEFAULT 0,
+            recipient      VARCHAR(200)  NULL,
+            owner_sig_hash CHAR(64)      NULL,
+            owner_x        DOUBLE        NOT NULL DEFAULT 0,
+            owner_y        DOUBLE        NOT NULL DEFAULT 0,
+            owner_w        DOUBLE        NOT NULL DEFAULT 0,
+            owner_page     INT           NOT NULL DEFAULT 0,
+            signed_pdf     VARCHAR(500)  NULL,
+            CONSTRAINT fk_doc_owner FOREIGN KEY (owner_id)       REFERENCES users(id),
+            CONSTRAINT fk_doc_sig   FOREIGN KEY (owner_sig_hash) REFERENCES signature_images(hash)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS document_reviewers (
+            doc_id  VARCHAR(24) NOT NULL,
+            step_no INT         NOT NULL,
+            user_id VARCHAR(16) NOT NULL,
+            PRIMARY KEY (doc_id, step_no),
+            CONSTRAINT fk_rev_doc  FOREIGN KEY (doc_id)  REFERENCES documents(id) ON DELETE CASCADE,
+            CONSTRAINT fk_rev_user FOREIGN KEY (user_id) REFERENCES users(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS attachments (
+            id     INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            doc_id VARCHAR(24)  NOT NULL,
+            name   VARCHAR(255) NOT NULL,
+            path   VARCHAR(500) NULL,
+            CONSTRAINT fk_att_doc FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS approvals (
+            id           INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            doc_id       VARCHAR(24)  NOT NULL,
+            step_no      INT          NOT NULL,
+            user_id      VARCHAR(16)  NOT NULL,
+            comment_text TEXT         NULL,
+            stamp        CHAR(64)     NOT NULL,
+            sig_data     VARCHAR(400) NOT NULL,
+            ts_string    VARCHAR(40)  NOT NULL,
+            approved_at  DATETIME     NOT NULL,
+            active       BOOLEAN      NOT NULL DEFAULT TRUE,
+            sig_hash     CHAR(64)     NULL,
+            px           DOUBLE       NOT NULL DEFAULT 0,
+            py           DOUBLE       NOT NULL DEFAULT 0,
+            pw           DOUBLE       NOT NULL DEFAULT 0,
+            placed       BOOLEAN      NOT NULL DEFAULT FALSE,
+            page         INT          NOT NULL DEFAULT 0,
+            CONSTRAINT fk_appr_doc  FOREIGN KEY (doc_id)   REFERENCES documents(id) ON DELETE CASCADE,
+            CONSTRAINT fk_appr_user FOREIGN KEY (user_id)  REFERENCES users(id),
+            CONSTRAINT fk_appr_sig  FOREIGN KEY (sig_hash) REFERENCES signature_images(hash)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        CREATE TABLE IF NOT EXISTS audit_ledger (
+            seq        INT          NOT NULL UNIQUE,
+            id         VARCHAR(16)  NOT NULL PRIMARY KEY,
+            category   VARCHAR(30)  NOT NULL,
+            title      VARCHAR(120) NOT NULL,
+            by_name    VARCHAR(160) NOT NULL,
+            actor_id   VARCHAR(16)  NULL,
+            ref        VARCHAR(40)  NULL,
+            hash       CHAR(64)     NULL,
+            note       TEXT         NULL,
+            prev_hash  VARCHAR(64)  NOT NULL,
+            entry_hash CHAR(64)     NOT NULL,
+            created_at DATETIME     NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        """
+        DROP TRIGGER IF EXISTS audit_ledger_no_update""",
+        """
+        CREATE TRIGGER audit_ledger_no_update BEFORE UPDATE ON audit_ledger FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_ledger is append-only'""",
+        """
+        DROP TRIGGER IF EXISTS audit_ledger_no_delete""",
+        """
+        CREATE TRIGGER audit_ledger_no_delete BEFORE DELETE ON audit_ledger FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_ledger is append-only'""",
+    };
 
-    // ------------------------------------------------------------------ document card (overview / lists)
-    static JComponent docCard(Doc d, Runnable open) {
-        Ui.Round c = Ui.card();
-        c.setBorder(new EmptyBorder(18, 22, 18, 22));
-        int n = d.reviewers.size();
-        Ui.Flex top = new Ui.Flex(new BorderLayout());
-        Ui.Flex left = Ui.vbox();
-        left.add(Ui.mono(d.id, 11, Ui.PRIMARY));
-        left.add(Ui.gap(4));
-        left.add(Ui.label(d.title, Font.BOLD, 14.5f, Ui.DARK));
-        left.add(Ui.gap(4));
-        left.add(Ui.small("Step " + d.displayStep() + " of " + n + " \u00b7 " + date(d.submitted)));
-        top.add(left, BorderLayout.CENTER);
-        Ui.Flex right = Ui.hbox();
-        right.add(Ui.statusChip(d.status));
-        right.add(Ui.hgap(10));
-        right.add(new Ui.Ico("chev", 14, Ui.MUTED));
-        top.add(Ui.top(right), BorderLayout.EAST);
-        c.add(top);
-        c.add(Ui.gap(14));
-        int done = d.status == DocStatus.APPROVED ? n : d.currentStep;
-        c.add(new Ui.Segments(n, done, d.status == DocStatus.PENDING_REVIEW ? d.currentStep : -1));
-        Ui.clickable(c, open);
-        return c;
+    private static Connection conn;
+    /** Hashes of signature PNGs already stored, so the same image is never sent twice. */
+    private static final Set<String> knownImages = new HashSet<>();
+
+    private static synchronized Connection conn() throws SQLException {
+        if (conn == null || conn.isClosed() || !conn.isValid(2)) conn = Database.getConnection();
+        return conn;
     }
 
-    static void openAttachment(Component parent, Attachment a) {
-        if (a.path == null) {
-            Main.info(parent, a.name + " is a demo placeholder, so there is no file stored for it.\n"
-                    + "Files you attach in \"Submit Form\" are copied to ~/.signit/attachments and open from here.");
-            return;
-        }
-        try { Desktop.getDesktop().open(new File(a.path)); }
-        catch (Exception e) { Main.info(parent, "Could not open " + a.name + " on this system."); }
-    }
-
-    static JComponent attachmentChips(Component parent, Doc d) {
-        Ui.Flex row = new Ui.Flex(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        for (Attachment a : d.attachments) {
-            Ui.Round chip = new Ui.Round(Ui.SOFT, null, 12);
-            chip.setLayout(new BoxLayout(chip, BoxLayout.X_AXIS));
-            chip.setBorder(new EmptyBorder(8, 12, 8, 14));
-            chip.add(new Ui.Ico("clip", 14, Ui.PRIMARY));
-            chip.add(Ui.hgap(7));
-            chip.add(Ui.label(a.name, Font.PLAIN, 12.5f, Ui.DARK));
-            Ui.clickable(chip, () -> openAttachment(parent, a));
-            row.add(chip);
-        }
-        if (d.attachments.isEmpty()) row.add(Ui.small("No attachments"));
-        return row;
-    }
-
-    // ------------------------------------------------------------------ document detail (applicant / admin view)
-    static JComponent detail(Shell sh, Doc d, String backKey, String backText) {
-        Store st = Store.get();
-        User me = sh.user;
-        Ui.VPanel p = Ui.page();
-
-        Ui.Btn back = new Ui.Btn("\u2039  " + backText, Ui.BStyle.LINK);
-        back.padH = 0; back.padV = 2;
-        back.addActionListener(e -> sh.go(backKey));
-        p.add(back);
-        p.add(Ui.gap(14));
-
-        Ui.Flex head = new Ui.Flex(new BorderLayout());
-        Ui.Flex hl = Ui.vbox();
-        hl.add(Ui.mono(d.id, 11.5f, Ui.PRIMARY));
-        hl.add(Ui.gap(3));
-        hl.add(Ui.label(d.title, Font.BOLD, 22, Ui.DARK));
-        hl.add(Ui.gap(4));
-        hl.add(Ui.sub("<html><body style='width:640px'>" + escape(d.description) + "</body></html>"));
-        head.add(hl, BorderLayout.CENTER);
-        head.add(Ui.top(Ui.statusChip(d.status)), BorderLayout.EAST);
-        p.add(head);
-        p.add(Ui.gap(18));
-
-        // document preview with every placed signature
-        Ui.Round prev = Ui.card();
-        prev.add(Ui.section("Document preview"));
-        prev.add(Ui.gap(12));
-        SignPaper view = SignPaper.forDoc(d, st);
-        prev.add(SignUi.pager(view));
-        prev.add(Ui.gap(8));
-        prev.add(SignUi.centered(view));
-        File signed = d.signedPdf == null ? null : new File(d.signedPdf);
-        if (signed != null && signed.isFile()) {
-            prev.add(Ui.gap(12));
-            Ui.Btn open = Ui.btn("Open signed PDF", Ui.BStyle.SOFT, () -> {
-                try { Desktop.getDesktop().open(signed); }
-                catch (Exception e) { Main.info(sh, "Could not open the signed PDF on this system.\nIt is saved at:\n" + signed); }
-            });
-            prev.add(open);
-        }
-        p.add(prev);
-        p.add(Ui.gap(16));
-
-        // feedback + resubmit for the owner
-        if (me.id.equals(d.ownerId) && (d.status == DocStatus.REVISION_REQUESTED || d.status == DocStatus.REJECTED)) {
-            String fb = "";
-            String by = "";
-            for (AuditEntry e : st.trail(d))
-                if (e.title.startsWith("Revision") || e.title.startsWith("Step-Back") || e.title.startsWith("Rejected")) {
-                    fb = e.note == null ? "" : e.note;
-                    by = e.by;
+    // ------------------------------------------------------------------ setup
+    static synchronized void ensureSchema() throws SQLException {
+        Database.ensureDatabase();
+        Connection c = conn();
+        try (Statement st = c.createStatement()) {
+            for (String sql : SCHEMA) {
+                try { st.executeUpdate(sql); }
+                catch (SQLException e) {
+                    if (sql.startsWith("CREATE TRIGGER") || sql.startsWith("DROP TRIGGER")) {
+                        // the ledger still works without the extra database-level protection
+                        System.err.println("Could not create ledger trigger: " + e.getMessage());
+                    } else throw e;
                 }
-            Ui.Round warn = new Ui.Round(new Color(0xFFF7ED), new Color(0xFED7AA), 20);
-            warn.setLayout(new BoxLayout(warn, BoxLayout.Y_AXIS));
-            warn.setBorder(new EmptyBorder(18, 24, 18, 24));
-            warn.add(Ui.label(d.status == DocStatus.REJECTED ? "REJECTED \u2014 PROGRESS RESET TO STEP 1" : "REVISION REQUESTED", Font.BOLD, 11, new Color(0xC2410C)));
-            warn.add(Ui.gap(8));
-            warn.add(Ui.label("<html><body style='width:640px'>" + escape(by.isEmpty() ? "" : by + ": ") + "\u201c" + escape(fb) + "\u201d</body></html>",
-                    Font.PLAIN, 13, Ui.DARK));
-            warn.add(Ui.gap(12));
-            warn.add(Ui.btn("Edit & Resubmit", Ui.BStyle.PRIMARY, () -> resubmitDialog(sh, d)));
-            p.add(warn);
-            p.add(Ui.gap(16));
-        }
-
-        // approval pipeline
-        Ui.Round pipe = Ui.card();
-        pipe.add(Ui.section("Approval pipeline"));
-        pipe.add(Ui.gap(14));
-        for (int i = 0; i < d.reviewers.size(); i++) {
-            User r = st.byId(d.reviewers.get(i));
-            Approval a = d.approvalAt(i);
-            boolean cur = i == d.currentStep && d.status != DocStatus.APPROVED && d.status != DocStatus.REJECTED;
-            int mode = a != null ? 2 : cur ? 1 : 0;
-            Ui.Flex row = new Ui.Flex(new BorderLayout(14, 0));
-            row.add(Ui.top(new Ui.StepDot(i + 1, mode)), BorderLayout.WEST);
-            Ui.Flex mid = Ui.vbox();
-            mid.add(Ui.label(r.name, Font.BOLD, 13.5f, Ui.DARK));
-            mid.add(Ui.small(r.position));
-            if (a != null) {
-                mid.add(Ui.gap(8));
-                Ui.Round q = new Ui.Round(new Color(0xFFEEF5), Ui.BORDER, 12);
-                q.setLayout(new BorderLayout());
-                q.setBorder(new EmptyBorder(9, 14, 9, 14));
-                q.add(Ui.label(a.comment == null || a.comment.isBlank() ? "Approved." : "\u201c" + a.comment + "\u201d", Font.PLAIN, 12, Ui.DARK));
-                mid.add(q);
-                mid.add(Ui.gap(6));
-                Ui.Flex h = Ui.hbox();
-                h.add(new Ui.Ico("lock", 11, Ui.MUTED));
-                h.add(Ui.hgap(5));
-                h.add(Ui.mono(a.stamp.substring(0, 12), 11, Ui.MUTED));
-                mid.add(h);
             }
-            row.add(mid, BorderLayout.CENTER);
-            String lbl; String kind;
-            if (a != null) { lbl = "Approved"; kind = "green"; }
-            else if (cur) { lbl = "Awaiting"; kind = "yellow"; }
-            else if (i == d.currentStep && d.status == DocStatus.REVISION_REQUESTED) { lbl = "Revision"; kind = "orange"; }
-            else { lbl = "Queued"; kind = "gray"; }
-            row.add(Ui.top(Ui.chip(lbl, kind)), BorderLayout.EAST);
-            pipe.add(row);
-            pipe.add(Ui.gap(16));
-        }
-        p.add(pipe);
-        p.add(Ui.gap(16));
-
-        // attachments
-        Ui.Round att = Ui.card();
-        att.add(Ui.section("Attachments"));
-        att.add(Ui.gap(12));
-        for (Attachment a : d.attachments) {
-            Ui.Round r = new Ui.Round(new Color(0xFFEEF5), null, 12);
-            r.setLayout(new BoxLayout(r, BoxLayout.X_AXIS));
-            r.setBorder(new EmptyBorder(13, 16, 13, 16));
-            r.add(new Ui.Ico("clip", 16, Ui.PRIMARY));
-            r.add(Ui.hgap(10));
-            r.add(Ui.label(a.name, Font.PLAIN, 13, Ui.DARK));
-            Ui.clickable(r, () -> openAttachment(sh, a));
-            att.add(r);
-            att.add(Ui.gap(8));
-        }
-        if (d.attachments.isEmpty()) att.add(Ui.small("No attachments were uploaded."));
-        p.add(att);
-        p.add(Ui.gap(16));
-
-        // audit trail
-        Ui.Round trail = Ui.card();
-        trail.add(Ui.section("Audit trail"));
-        trail.add(Ui.gap(14));
-        for (AuditEntry e : st.trail(d)) {
-            Ui.Flex row = new Ui.Flex(new BorderLayout(10, 0));
-            row.add(Ui.top(new Ui.Dot()), BorderLayout.WEST);
-            Ui.Flex mid = Ui.vbox();
-            mid.add(Ui.label(e.title, Font.BOLD, 13, Ui.DARK));
-            mid.add(Ui.small("by " + e.by));
-            if (e.hash != null) mid.add(Ui.mono("SHA-256: " + e.hash.substring(0, 12) + "\u2026", 11, Ui.PRIMARY));
-            if (e.note != null && !e.note.isBlank()) mid.add(Ui.label("\u201c" + e.note + "\u201d", Font.ITALIC, 11.5f, Ui.MUTED));
-            row.add(mid, BorderLayout.CENTER);
-            row.add(Ui.top(Ui.mono(e.time.format(Store.TS), 11, Ui.PRIMARY)), BorderLayout.EAST);
-            trail.add(row);
-            trail.add(Ui.gap(12));
-        }
-        p.add(trail);
-        return p;
-    }
-
-    private static String escape(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-    }
-
-    private static void resubmitDialog(Shell sh, Doc d) {
-        Ui.Area desc = new Ui.Area("Update the description", 4);
-        desc.setText(d.description);
-        Ui.Area note = new Ui.Area("Note to reviewers (what did you change?)", 3);
-        List<File> files = new ArrayList<>();
-        JLabel fl = Ui.small("No new files attached.");
-        Ui.Flex f = Ui.vbox();
-        f.setBorder(new EmptyBorder(6, 6, 6, 6));
-        f.setPreferredSize(new Dimension(460, 360));
-        f.add(Ui.field("Description", desc));
-        f.add(Ui.field("Add supporting documents", Ui.dropZone("Click to upload or drag & drop", l -> {
-            files.addAll(l);
-            fl.setText(files.size() + " new file(s): " + names(files));
-        })));
-        f.add(fl);
-        f.add(Ui.gap(12));
-        f.add(Ui.field("Note", note));
-        if (JOptionPane.showConfirmDialog(sh, f, "Edit & Resubmit " + d.id, JOptionPane.OK_CANCEL_OPTION,
-                JOptionPane.PLAIN_MESSAGE) == JOptionPane.OK_OPTION) {
-            Store.get().resubmit(d, sh.user, desc.getText().trim(), files, note.getText().trim());
-            Main.info(sh, d.id + " was resubmitted and is back in the reviewer's queue.");
-            sh.refresh();
         }
     }
 
-    static String names(List<File> files) {
-        StringBuilder sb = new StringBuilder();
-        for (File f : files) sb.append(sb.length() == 0 ? "" : ", ").append(f.getName());
-        return sb.toString();
+    static synchronized boolean hasUsers() throws SQLException {
+        try (Statement st = conn().createStatement(); ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM users")) {
+            return rs.next() && rs.getInt(1) > 0;
+        }
     }
 
-    // ------------------------------------------------------------------ profile & e-signature vault
-    static JComponent profile(Shell sh) {
-        Store st = Store.get();
-        User u = sh.user;
-        Ui.VPanel p = Ui.page();
-        p.add(Ui.h1("Profile & Signatures"));
-        p.add(Ui.gap(20));
+    /** Empties every table (used by "Reset demo data"). */
+    static synchronized void wipe() throws SQLException {
+        Connection c = conn();
+        try (Statement st = c.createStatement()) {
+            st.execute("SET FOREIGN_KEY_CHECKS=0");
+            for (String t : new String[]{"approvals", "attachments", "document_reviewers", "documents",
+                    "user_signatures", "signature_images", "users", "audit_ledger", "meta"})
+                st.execute("TRUNCATE TABLE " + t);           // TRUNCATE is not blocked by the ledger triggers
+            st.execute("SET FOREIGN_KEY_CHECKS=1");
+        }
+        knownImages.clear();
+    }
 
-        Ui.Round c = Ui.card();
-        Ui.Flex top = Ui.hbox();
-        top.add(new Ui.Avatar(u.initials(), 62));
-        top.add(Ui.hgap(18));
-        Ui.Flex who = Ui.vbox();
-        who.add(Ui.label(u.name, Font.BOLD, 17, Ui.DARK));
-        who.add(Ui.label(u.email, Font.PLAIN, 12.5f, Ui.MUTED));
-        who.add(Ui.label(u.position + " \u00b7 " + u.role.label, Font.PLAIN, 11.5f, Ui.LABEL));
-        top.add(who);
-        c.add(top);
-        c.add(Ui.gap(20));
-        JPanel grid = new JPanel(new GridLayout(2, 2, 20, 14));
-        grid.setOpaque(false);
-        grid.setAlignmentX(0f);
-        grid.add(kv("User ID", u.id));
-        grid.add(kv("Department", u.department));
-        grid.add(kv("Role", u.role == Role.STUDENT ? "Student / Applicant" : u.role == Role.FACULTY ? "Faculty / Approver" : "Super Admin"));
-        grid.add(kv("Status", u.status == UserStatus.ACTIVE ? "Active" : "Pending"));
-        c.add(grid);
-        if (u.role == Role.STUDENT || u.role == Role.FACULTY) {
-            c.add(Ui.gap(16));
-            if (u.requestedRole != null) {
-                c.add(Ui.chip("Role elevation to " + u.requestedRole.label + " is pending Super Admin approval", "yellow"));
-            } else if (u.role == Role.STUDENT) {
-                c.add(Ui.btn("Request Faculty role", Ui.BStyle.SOFT, () -> {
-                    if (JOptionPane.showConfirmDialog(sh, "Send a role elevation request to the Super Admin?\nYour access stays the same until it is approved.",
-                            "Role elevation", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
-                        st.requestElevation(u, Role.FACULTY);
-                        sh.refresh();
+    // ------------------------------------------------------------------ load
+    static synchronized Store load() throws SQLException {
+        Connection c = conn();
+        Store s = new Store();
+        Map<String, byte[]> images = new HashMap<>();
+        Map<String, Doc> docs = new HashMap<>();
+        Map<String, User> users = new HashMap<>();
+
+        try (Statement st = c.createStatement()) {
+            try (ResultSet rs = st.executeQuery("SELECT hash, data FROM signature_images")) {
+                while (rs.next()) images.put(rs.getString(1), rs.getBytes(2));
+            }
+            try (ResultSet rs = st.executeQuery("SELECT * FROM users ORDER BY id")) {
+                while (rs.next()) {
+                    User u = new User();
+                    u.id = rs.getString("id"); u.name = rs.getString("name"); u.email = rs.getString("email");
+                    u.passHash = rs.getString("pass_hash"); u.department = rs.getString("department");
+                    u.position = rs.getString("position"); u.role = Role.valueOf(rs.getString("role"));
+                    String rr = rs.getString("requested_role");
+                    u.requestedRole = rr == null ? null : Role.valueOf(rr);
+                    u.status = UserStatus.valueOf(rs.getString("status"));
+                    u.joined = rs.getObject("joined", LocalDate.class);
+                    u.signatureText = rs.getString("signature_text");
+                    u.library = new ArrayList<>();
+                    s.users.add(u);
+                    users.put(u.id, u);
+                }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT user_id, name, image_hash FROM user_signatures ORDER BY user_id, slot")) {
+                while (rs.next()) {
+                    User u = users.get(rs.getString(1));
+                    byte[] png = images.get(rs.getString(3));
+                    if (u != null && png != null) u.library.add(new SigAsset(rs.getString(2), png));
+                }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT * FROM documents ORDER BY submitted, id")) {
+                while (rs.next()) {
+                    Doc d = new Doc();
+                    d.id = rs.getString("id"); d.title = rs.getString("title"); d.type = rs.getString("type");
+                    d.description = rs.getString("description"); d.ownerId = rs.getString("owner_id");
+                    d.currentStep = rs.getInt("current_step"); d.revisionStep = rs.getInt("revision_step");
+                    d.status = DocStatus.valueOf(rs.getString("status"));
+                    d.submitted = rs.getObject("submitted", LocalDateTime.class);
+                    d.amount = rs.getDouble("amount"); d.recipient = rs.getString("recipient");
+                    String h = rs.getString("owner_sig_hash");
+                    d.ownerSig = h == null ? null : images.get(h);
+                    d.ownerX = rs.getDouble("owner_x"); d.ownerY = rs.getDouble("owner_y");
+                    d.ownerW = rs.getDouble("owner_w"); d.ownerPage = rs.getInt("owner_page");
+                    d.signedPdf = rs.getString("signed_pdf");
+                    s.docs.add(d);
+                    docs.put(d.id, d);
+                }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT doc_id, user_id FROM document_reviewers ORDER BY doc_id, step_no")) {
+                while (rs.next()) { Doc d = docs.get(rs.getString(1)); if (d != null) d.reviewers.add(rs.getString(2)); }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT doc_id, name, path FROM attachments ORDER BY id")) {
+                while (rs.next()) { Doc d = docs.get(rs.getString(1)); if (d != null) d.attachments.add(new Attachment(rs.getString(2), rs.getString(3))); }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT * FROM approvals ORDER BY id")) {
+                while (rs.next()) {
+                    Doc d = docs.get(rs.getString("doc_id"));
+                    if (d == null) continue;
+                    Approval a = new Approval();
+                    a.step = rs.getInt("step_no"); a.userId = rs.getString("user_id");
+                    a.comment = rs.getString("comment_text"); a.stamp = rs.getString("stamp");
+                    a.sigData = rs.getString("sig_data"); a.tsString = rs.getString("ts_string");
+                    a.time = rs.getObject("approved_at", LocalDateTime.class);
+                    a.active = rs.getBoolean("active");
+                    String h = rs.getString("sig_hash");
+                    a.sigImage = h == null ? null : images.get(h);
+                    a.px = rs.getDouble("px"); a.py = rs.getDouble("py"); a.pw = rs.getDouble("pw");
+                    a.placed = rs.getBoolean("placed"); a.page = rs.getInt("page");
+                    d.approvals.add(a);
+                }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT * FROM audit_ledger ORDER BY seq")) {
+                while (rs.next()) {
+                    AuditEntry e = new AuditEntry();
+                    e.id = rs.getString("id"); e.category = rs.getString("category"); e.title = rs.getString("title");
+                    e.by = rs.getString("by_name"); e.actorId = rs.getString("actor_id"); e.ref = rs.getString("ref");
+                    e.hash = rs.getString("hash"); e.note = rs.getString("note");
+                    e.prevHash = rs.getString("prev_hash"); e.entryHash = rs.getString("entry_hash");
+                    e.time = rs.getObject("created_at", LocalDateTime.class);
+                    s.ledger.add(e);
+                }
+            }
+            try (ResultSet rs = st.executeQuery("SELECT k, v FROM meta")) {
+                while (rs.next()) {
+                    if (rs.getString(1).equals("docSeq")) s.docSeq = Integer.parseInt(rs.getString(2));
+                    if (rs.getString(1).equals("userSeq")) s.userSeq = Integer.parseInt(rs.getString(2));
+                }
+            }
+        }
+        knownImages.clear();
+        knownImages.addAll(images.keySet());
+        s.ledgerSaved = s.ledger.size();
+        return s;
+    }
+
+    // ------------------------------------------------------------------ save
+    /** Writes the whole in-memory state in one transaction. New ledger rows are appended, never rewritten. */
+    static synchronized void sync(Store s) throws SQLException {
+        Connection c = conn();
+        Set<String> pending = new HashSet<>();
+        try {
+            c.setAutoCommit(false);
+            writeAll(c, s, pending);
+            c.commit();
+        } catch (SQLException | RuntimeException e) {
+            try { c.rollback(); } catch (SQLException ignored) { }
+            throw e;
+        } finally {
+            try { c.setAutoCommit(true); } catch (SQLException ignored) { }
+        }
+        knownImages.addAll(pending);
+        s.ledgerSaved = s.ledger.size();
+    }
+
+    private static String image(PreparedStatement ins, byte[] png, Set<String> pending) throws SQLException {
+        if (png == null) return null;
+        String h = Store.sha256(png);
+        if (!knownImages.contains(h) && pending.add(h)) {
+            ins.setString(1, h);
+            ins.setBytes(2, png);
+            ins.executeUpdate();
+        }
+        return h;
+    }
+
+    private static String cut(String s, int max) { return s == null || s.length() <= max ? s : s.substring(0, max); }
+
+    private static void writeAll(Connection c, Store s, Set<String> pending) throws SQLException {
+        try (PreparedStatement img = c.prepareStatement("INSERT IGNORE INTO signature_images (hash, data) VALUES (?, ?)")) {
+            // ---- users
+            try (PreparedStatement up = c.prepareStatement(
+                    "INSERT INTO users (id, name, email, pass_hash, department, `position`, role, requested_role, status, joined, signature_text) "
+                  + "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name), email=VALUES(email), "
+                  + "pass_hash=VALUES(pass_hash), department=VALUES(department), `position`=VALUES(`position`), role=VALUES(role), "
+                  + "requested_role=VALUES(requested_role), status=VALUES(status), joined=VALUES(joined), signature_text=VALUES(signature_text)")) {
+                for (User u : s.users) {
+                    up.setString(1, u.id); up.setString(2, u.name); up.setString(3, u.email); up.setString(4, u.passHash);
+                    up.setString(5, u.department); up.setString(6, u.position); up.setString(7, u.role.name());
+                    up.setString(8, u.requestedRole == null ? null : u.requestedRole.name());
+                    up.setString(9, u.status.name()); up.setObject(10, u.joined); up.setString(11, u.signatureText);
+                    up.executeUpdate();
+                }
+            }
+            // ---- signature libraries
+            try (PreparedStatement del = c.prepareStatement("DELETE FROM user_signatures WHERE user_id = ?");
+                 PreparedStatement ins = c.prepareStatement("INSERT INTO user_signatures (user_id, slot, name, image_hash) VALUES (?,?,?,?)")) {
+                for (User u : s.users) {
+                    if (u.library == null) continue;            // library not created yet; nothing to change
+                    del.setString(1, u.id);
+                    del.executeUpdate();
+                    int slot = 0;
+                    for (SigAsset a : u.library) {
+                        String h = image(img, a.png, pending);
+                        ins.setString(1, u.id); ins.setInt(2, slot++); ins.setString(3, cut(a.name, 160)); ins.setString(4, h);
+                        ins.executeUpdate();
                     }
-                }));
+                }
+            }
+            // ---- documents and their children
+            try (PreparedStatement up = c.prepareStatement(
+                    "INSERT INTO documents (id, title, type, description, owner_id, current_step, revision_step, status, submitted, amount, "
+                  + "recipient, owner_sig_hash, owner_x, owner_y, owner_w, owner_page, signed_pdf) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                  + "ON DUPLICATE KEY UPDATE title=VALUES(title), type=VALUES(type), description=VALUES(description), owner_id=VALUES(owner_id), "
+                  + "current_step=VALUES(current_step), revision_step=VALUES(revision_step), status=VALUES(status), submitted=VALUES(submitted), "
+                  + "amount=VALUES(amount), recipient=VALUES(recipient), owner_sig_hash=VALUES(owner_sig_hash), owner_x=VALUES(owner_x), "
+                  + "owner_y=VALUES(owner_y), owner_w=VALUES(owner_w), owner_page=VALUES(owner_page), signed_pdf=VALUES(signed_pdf)");
+                 PreparedStatement delRev = c.prepareStatement("DELETE FROM document_reviewers WHERE doc_id = ?");
+                 PreparedStatement delAtt = c.prepareStatement("DELETE FROM attachments WHERE doc_id = ?");
+                 PreparedStatement delApp = c.prepareStatement("DELETE FROM approvals WHERE doc_id = ?");
+                 PreparedStatement insRev = c.prepareStatement("INSERT INTO document_reviewers (doc_id, step_no, user_id) VALUES (?,?,?)");
+                 PreparedStatement insAtt = c.prepareStatement("INSERT INTO attachments (doc_id, name, path) VALUES (?,?,?)");
+                 PreparedStatement insApp = c.prepareStatement(
+                         "INSERT INTO approvals (doc_id, step_no, user_id, comment_text, stamp, sig_data, ts_string, approved_at, active, "
+                       + "sig_hash, px, py, pw, placed, page) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
+                for (Doc d : s.docs) {
+                    String ownerHash = image(img, d.ownerSig, pending);
+                    up.setString(1, d.id); up.setString(2, d.title); up.setString(3, d.type); up.setString(4, d.description);
+                    up.setString(5, d.ownerId); up.setInt(6, d.currentStep); up.setInt(7, d.revisionStep);
+                    up.setString(8, d.status.name()); up.setObject(9, d.submitted); up.setDouble(10, d.amount);
+                    up.setString(11, d.recipient); up.setString(12, ownerHash); up.setDouble(13, d.ownerX);
+                    up.setDouble(14, d.ownerY); up.setDouble(15, d.ownerW); up.setInt(16, d.ownerPage); up.setString(17, d.signedPdf);
+                    up.executeUpdate();
+
+                    delRev.setString(1, d.id); delRev.executeUpdate();
+                    delAtt.setString(1, d.id); delAtt.executeUpdate();
+                    delApp.setString(1, d.id); delApp.executeUpdate();
+                    for (int i = 0; i < d.reviewers.size(); i++) {
+                        insRev.setString(1, d.id); insRev.setInt(2, i); insRev.setString(3, d.reviewers.get(i));
+                        insRev.executeUpdate();
+                    }
+                    for (Attachment a : d.attachments) {
+                        insAtt.setString(1, d.id); insAtt.setString(2, cut(a.name, 255)); insAtt.setString(3, a.path);
+                        insAtt.executeUpdate();
+                    }
+                    for (Approval a : d.approvals) {
+                        String h = image(img, a.sigImage, pending);
+                        insApp.setString(1, d.id); insApp.setInt(2, a.step); insApp.setString(3, a.userId);
+                        insApp.setString(4, a.comment); insApp.setString(5, a.stamp); insApp.setString(6, a.sigData);
+                        insApp.setString(7, a.tsString); insApp.setObject(8, a.time); insApp.setBoolean(9, a.active);
+                        insApp.setString(10, h); insApp.setDouble(11, a.px); insApp.setDouble(12, a.py);
+                        insApp.setDouble(13, a.pw); insApp.setBoolean(14, a.placed); insApp.setInt(15, a.page);
+                        insApp.executeUpdate();
+                    }
+                }
             }
         }
-        p.add(c);
-        p.add(Ui.gap(16));
-
-        Ui.Round v = Ui.card();
-        v.add(Ui.section("Signature library"));
-        v.add(Ui.gap(8));
-        v.add(Ui.sub("<html><body style='width:620px'>Save your signatures as PNG images. When you sign a document, drag one onto the page "
-                + "(or click it). Each signature is sealed into the document with a SHA-256 stamp.</body></html>"));
-        v.add(Ui.gap(14));
-        JPanel sigGrid = new JPanel(new GridLayout(0, 3, 14, 14));
-        sigGrid.setOpaque(false);
-        List<SigAsset> lib = st.sigs(u);
-        for (int i = 0; i < lib.size(); i++) sigGrid.add(sigTile(sh, st, u, lib.get(i), i == 0, lib.size() > 1));
-        Ui.Flex gw = new Ui.Flex(new BorderLayout());
-        gw.add(sigGrid, BorderLayout.NORTH);
-        v.add(gw);
-        v.add(Ui.gap(16));
-        Ui.Flex acts = Ui.hbox();
-        acts.add(Ui.btn("Upload PNG", Ui.BStyle.PRIMARY, () -> {
-            SigAsset a = SigTools.upload(sh);
-            if (a != null) { st.addSignature(u, a.name, a.png); sh.refresh(); }
-        }));
-        acts.add(Ui.hgap(10));
-        acts.add(Ui.btn("Draw signature", Ui.BStyle.SOFT, () -> {
-            byte[] png = SigTools.draw(sh);
-            if (png != null) { st.addSignature(u, "Drawn signature " + (st.sigs(u).size() + 1), png); sh.refresh(); }
-        }));
-        acts.add(Box.createHorizontalGlue());
-        v.add(acts);
-        p.add(v);
-        return p;
-    }
-
-    private static JComponent sigTile(Shell sh, Store st, User u, SigAsset a, boolean isDefault, boolean canDelete) {
-        Ui.Round t = new Ui.Round(Color.WHITE, Ui.BORDER, 16);
-        t.setLayout(new BorderLayout(0, 8));
-        t.setBorder(new EmptyBorder(10, 10, 10, 10));
-        t.add(new SigPreview(a.png, 200, 84), BorderLayout.CENTER);
-        Ui.Flex foot = Ui.vbox();
-        foot.add(Ui.label(a.name, Font.BOLD, 12, Ui.DARK));
-        Ui.Flex r = Ui.hbox();
-        if (isDefault) r.add(Ui.chip("Default", "green"));
-        else {
-            Ui.Btn d = Ui.btn("Make default", Ui.BStyle.LINK, () -> { st.makeDefaultSignature(u, a); sh.refresh(); });
-            d.padH = 0; d.padV = 2; d.setFont(Ui.font(Font.PLAIN, 12));
-            r.add(d);
+        // ---- ledger: append only
+        try (PreparedStatement ins = c.prepareStatement(
+                "INSERT INTO audit_ledger (seq, id, category, title, by_name, actor_id, ref, hash, note, prev_hash, entry_hash, created_at) "
+              + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")) {
+            for (int i = s.ledgerSaved; i < s.ledger.size(); i++) {
+                AuditEntry e = s.ledger.get(i);
+                ins.setInt(1, i + 1); ins.setString(2, e.id); ins.setString(3, e.category); ins.setString(4, cut(e.title, 120));
+                ins.setString(5, cut(e.by, 160)); ins.setString(6, e.actorId); ins.setString(7, e.ref); ins.setString(8, e.hash);
+                ins.setString(9, e.note); ins.setString(10, e.prevHash); ins.setString(11, e.entryHash); ins.setObject(12, e.time);
+                ins.executeUpdate();
+            }
         }
-        r.add(Box.createHorizontalGlue());
-        if (canDelete) {
-            Ui.Btn del = Ui.btn("Delete", Ui.BStyle.LINK, () -> {
-                if (JOptionPane.showConfirmDialog(sh, "Delete \"" + a.name + "\" from your library?\nDocuments already signed keep their signature.",
-                        "Delete signature", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
-                    st.deleteSignature(u, a);
-                    sh.refresh();
-                }
-            });
-            del.padH = 0; del.padV = 2; del.setFont(Ui.font(Font.PLAIN, 12));
-            r.add(del);
+        // ---- counters
+        try (PreparedStatement m = c.prepareStatement("INSERT INTO meta (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)")) {
+            m.setString(1, "docSeq"); m.setString(2, String.valueOf(s.docSeq)); m.executeUpdate();
+            m.setString(1, "userSeq"); m.setString(2, String.valueOf(s.userSeq)); m.executeUpdate();
         }
-        foot.add(r);
-        t.add(foot, BorderLayout.SOUTH);
-        return t;
-    }
-
-    private static JComponent kv(String k, String v) {
-        Ui.Flex f = Ui.vbox();
-        f.add(Ui.small(k));
-        f.add(Ui.gap(3));
-        f.add(Ui.label(v, Font.BOLD, 13, Ui.DARK));
-        return f;
     }
 }
